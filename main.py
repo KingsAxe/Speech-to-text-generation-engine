@@ -1,16 +1,26 @@
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from digit_recognition import SpeechTranscriber
 import uvicorn
 import asyncio
 import numpy as np
 import logging
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
-from digit_recognition import SpeechTranscriber
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify the Streamlit origin
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Task 1.1 & 1.3: Initialize Transcriber
 # We use 'base' for a good balance of speed and accuracy
@@ -142,8 +152,11 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection established")
     
-    # Internal buffer to hold audio chunks
+    # Task 4.1: Internal buffer with sliding window support
     audio_buffer = []
+    # Keep last ~1 second of audio for context (16000 samples)
+    context_samples = 16000 
+    last_context = np.array([], dtype=np.float32)
     
     # We'll use a lock to prevent concurrent transcription calls on the same session
     transcribe_lock = asyncio.Lock()
@@ -155,21 +168,33 @@ async def websocket_endpoint(websocket: WebSocket):
             
         async with transcribe_lock:
             try:
+                # Task 4.1: Prepend context from previous window
+                nonlocal last_context
+                combined_audio = np.concatenate([last_context, audio_np])
+                
                 # Task 2.2: Apply noise reduction
-                processed_audio = audio_np
+                processed_audio = combined_audio
                 if denoise:
                     processed_audio = await asyncio.to_thread(
                         transcriber.processor.denoise, 
-                        audio_np, 
+                        combined_audio, 
                         sample_rate=16000
                     )
 
-                # Transcribe
+                # Transcribe with VAD filter enabled for Task 3.2
                 result = await asyncio.to_thread(
                     transcriber.transcribe_array, 
                     processed_audio, 
-                    sample_rate=16000
+                    sample_rate=16000,
+                    vad_filter=True
                 )
+                
+                # Update context window for next chunk
+                if len(combined_audio) > context_samples:
+                    last_context = combined_audio[-context_samples:]
+                else:
+                    last_context = combined_audio
+
                 if result.text.strip() and result.text != "No speech detected.":
                     await websocket.send_json({
                         "type": "final", 
@@ -193,9 +218,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 chunk = np.frombuffer(data, dtype=np.float32)
                 audio_buffer.append(chunk)
                 
-                if len(audio_buffer) >= 12:
-                    full_audio = np.concatenate(audio_buffer)
-                    asyncio.create_task(transcribe_chunk(full_audio, denoise=use_denoise))
+                # Trigger transcription every ~2 seconds (at 16kHz, 32000 samples)
+                # 4096 samples per chunk * 8 chunks ~= 32768 samples
+                if len(audio_buffer) >= 8:
+                    current_audio = np.concatenate(audio_buffer)
+                    asyncio.create_task(transcribe_chunk(current_audio, denoise=use_denoise))
                     audio_buffer = []
             elif "text" in message:
                 import json

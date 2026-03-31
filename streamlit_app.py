@@ -921,6 +921,117 @@ def _render_about_page() -> None:
             st.image(AUTHOR_IMAGE, use_container_width=True)
 
 
+def _render_realtime_transcription() -> None:
+    _section_intro(
+        "Real-time Transcription",
+        "Speak naturally and watch the transcript appear in real-time. This mode uses a persistent WebSocket connection for low-latency processing.",
+        anchor_id="realtime-section",
+    )
+    
+    # We use a custom HTML component to handle the WebSocket and Audio recording
+    # because Streamlit's native components are not optimized for low-latency streaming.
+    st.components.v1.html(
+        """
+        <div id="realtime-container" style="background: rgba(255, 252, 245, 0.88); border: 1px solid rgba(148, 163, 184, 0.18); border-radius: 24px; padding: 1.25rem; box-shadow: 0 12px 34px rgba(15, 23, 42, 0.06); font-family: sans-serif;">
+            <div style="display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem;">
+                <button id="start-rt" style="background: #0f766e; color: white; border: none; padding: 0.6rem 1.2rem; border-radius: 999px; cursor: pointer; font-weight: 600;">Start Live Recording</button>
+                <button id="stop-rt" disabled style="background: #e2e8f0; color: #64748b; border: none; padding: 0.6rem 1.2rem; border-radius: 999px; cursor: pointer; font-weight: 600;">Stop</button>
+                <label style="color: #4b5563; font-size: 0.9rem; display: flex; align-items: center; gap: 0.4rem;">
+                    <input type="checkbox" id="denoise-rt" checked> AI Denoise
+                </label>
+                <span id="status-rt" style="font-size: 0.85rem; color: #64748b;">Ready</span>
+            </div>
+            <div id="transcript-rt" style="color: #102a26; font-size: 1.05rem; line-height: 1.7; min-height: 150px; white-space: pre-wrap; background: white; padding: 1rem; border-radius: 16px; border: 1px solid #f1f5f9;"></div>
+        </div>
+
+        <script>
+            let socket;
+            let audioContext;
+            let processor;
+            let input;
+
+            const startBtn = document.getElementById('start-rt');
+            const stopBtn = document.getElementById('stop-rt');
+            const denoiseCheckbox = document.getElementById('denoise-rt');
+            const transcriptDiv = document.getElementById('transcript-rt');
+            const statusSpan = document.getElementById('status-rt');
+
+            denoiseCheckbox.onchange = () => {
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    socket.send(JSON.stringify({ denoise: denoiseCheckbox.checked }));
+                }
+            };
+
+            startBtn.onclick = async () => {
+                // In a real deployment, replace with your actual WebSocket URL
+                const wsUrl = `ws://${window.location.hostname}:8000/ws/transcribe`;
+                socket = new WebSocket(wsUrl);
+                
+                socket.onopen = () => {
+                    statusSpan.innerText = "● Connected";
+                    statusSpan.style.color = "#10b981";
+                    socket.send(JSON.stringify({ denoise: denoiseCheckbox.checked }));
+                };
+
+                socket.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    if (data.type === "final") {
+                        const tag = data.denoised ? "" : "";
+                        transcriptDiv.innerText += data.text + " ";
+                        transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
+                    } else if (data.type === "error") {
+                        statusSpan.innerText = "Error: " + data.message;
+                        statusSpan.style.color = "#ef4444";
+                    }
+                };
+
+                socket.onclose = () => {
+                    statusSpan.innerText = "Disconnected";
+                    statusSpan.style.color = "#64748b";
+                };
+
+                try {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 16000});
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    input = audioContext.createMediaStreamSource(stream);
+                    processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                    processor.onaudioprocess = (e) => {
+                        const channelData = e.inputBuffer.getChannelData(0);
+                        if (socket.readyState === WebSocket.OPEN) {
+                            socket.send(channelData.buffer);
+                        }
+                    };
+
+                    input.connect(processor);
+                    processor.connect(audioContext.destination);
+
+                    startBtn.disabled = true;
+                    startBtn.style.background = "#e2e8f0";
+                    stopBtn.disabled = false;
+                    stopBtn.style.background = "#ef4444";
+                    stopBtn.style.color = "white";
+                } catch (err) {
+                    alert("Mic access denied or WebSocket server not running on port 8000.");
+                }
+            };
+
+            stopBtn.onclick = () => {
+                if (processor) { processor.disconnect(); input.disconnect(); }
+                if (socket) { socket.close(); }
+                startBtn.disabled = false;
+                startBtn.style.background = "#0f766e";
+                stopBtn.disabled = true;
+                stopBtn.style.background = "#e2e8f0";
+                stopBtn.style.color = "#64748b";
+                statusSpan.innerText = "Stopped";
+            };
+        </script>
+        """,
+        height=320,
+    )
+
+
 def _render_app_page() -> None:
     _render_hero()
 
@@ -957,17 +1068,21 @@ def _render_app_page() -> None:
     _section_intro(
         "Input",
         (
-            "Pick how you want to interact with the app. The microphone option works "
-            "directly in the browser, while upload mode is handy for pre-recorded test clips."
+            "Pick how you want to interact with the app. Real-time mode is best for live dictation, "
+            "while upload mode is handy for pre-recorded test clips."
         ),
         anchor_id="input-section",
     )
 
     input_method = st.radio(
         "Audio source",
-        ["Record with microphone", "Upload audio file"],
+        ["Real-time transcription", "Record with microphone", "Upload audio file"],
         horizontal=True,
     )
+
+    if input_method == "Real-time transcription":
+        _render_realtime_transcription()
+        return
 
     audio_source = None
     if input_method == "Record with microphone":

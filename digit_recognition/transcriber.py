@@ -115,6 +115,12 @@ class SpeechTranscriber:
     def _load_model(self):
         if self._model is not None:
             return self._model
+        
+        # Check if model is already loaded in a global/class variable to save memory
+        if hasattr(SpeechTranscriber, "_shared_model") and SpeechTranscriber._shared_model is not None:
+            self._model = SpeechTranscriber._shared_model
+            return self._model
+
         try:
             from faster_whisper import WhisperModel
         except ImportError as exc:  # pragma: no cover - depends on environment
@@ -127,17 +133,21 @@ class SpeechTranscriber:
             resolved_device = "cpu"
             try:
                 import torch
-
                 if torch.cuda.is_available():
                     resolved_device = "cuda"
             except ImportError:
                 resolved_device = "cpu"
 
+        logger = logging.getLogger(__name__)
+        logger.info(f"Loading Whisper model '{self.model_size}' on {resolved_device}...")
+        
         self._model = WhisperModel(
             self.model_size,
             device=resolved_device,
             compute_type=self.compute_type,
         )
+        # Store as shared model for other instances
+        SpeechTranscriber._shared_model = self._model
         return self._model
 
     def _result_from_segments(self, segments: Sequence[object], info: object) -> TranscriptionResult:
