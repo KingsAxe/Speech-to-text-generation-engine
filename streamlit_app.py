@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv
+import json
+import os
 import tempfile
 from datetime import datetime, timezone
 from html import escape
@@ -53,6 +55,10 @@ def _inject_styles() -> None:
             padding-top: 2rem;
             padding-bottom: 3rem;
             max-width: 1180px;
+        }
+        .stCheckbox label p {
+            color: #102a26 !important;
+            font-weight: 600 !important;
         }
         [data-testid="stSidebar"] {
             background-color: #f7f3ea;
@@ -481,6 +487,21 @@ def _inject_styles() -> None:
     )
 
 
+def _get_realtime_ws_url_hint() -> str:
+    """Return an optional WebSocket URL override for real-time transcription."""
+    for key in ("REALTIME_WS_URL", "REALTIME_API_BASE_URL"):
+        value = os.getenv(key, "").strip()
+        if value:
+            if key == "REALTIME_API_BASE_URL":
+                if value.startswith("https://"):
+                    return f"wss://{value.removeprefix('https://').rstrip('/')}/ws/transcribe"
+                if value.startswith("http://"):
+                    return f"ws://{value.removeprefix('http://').rstrip('/')}/ws/transcribe"
+                return value.rstrip("/") + "/ws/transcribe"
+            return value
+    return ""
+
+
 def _render_hero(
     kicker: str = "Live Speech-to-Text",
     title: str = "Speech-to-Text Transcription",
@@ -558,8 +579,6 @@ def _render_footer() -> None:
 
 
 def _plot_audio(audio: np.ndarray, sample_rate: int):
-    import librosa
-
     figure, axes = plt.subplots(2, 1, figsize=(10, 6))
     times = np.arange(len(audio)) / sample_rate
     axes[0].plot(times, audio, color="#0f766e", linewidth=1)
@@ -567,13 +586,22 @@ def _plot_audio(audio: np.ndarray, sample_rate: int):
     axes[0].set_xlabel("Time (s)")
     axes[0].set_ylabel("Amplitude")
 
-    mel = librosa.feature.melspectrogram(y=audio, sr=sample_rate, n_mels=64, n_fft=1024, hop_length=256)
-    mel_db = librosa.power_to_db(mel, ref=np.max)
-    image = axes[1].imshow(mel_db, aspect="auto", origin="lower", cmap="magma")
-    axes[1].set_title("Mel Spectrogram")
-    axes[1].set_xlabel("Frame")
-    axes[1].set_ylabel("Mel Bin")
-    figure.colorbar(image, ax=axes[1], shrink=0.8)
+    try:
+        import librosa
+
+        mel = librosa.feature.melspectrogram(y=audio, sr=sample_rate, n_mels=64, n_fft=1024, hop_length=256)
+        mel_db = librosa.power_to_db(mel, ref=np.max)
+        image = axes[1].imshow(mel_db, aspect="auto", origin="lower", cmap="magma")
+        axes[1].set_title("Mel Spectrogram")
+        axes[1].set_xlabel("Frame")
+        axes[1].set_ylabel("Mel Bin")
+        figure.colorbar(image, ax=axes[1], shrink=0.8)
+    except ImportError:
+        _, _, _, image = axes[1].specgram(audio, Fs=sample_rate, NFFT=1024, noverlap=768, cmap="magma")
+        axes[1].set_title("Spectrogram")
+        axes[1].set_xlabel("Time (s)")
+        axes[1].set_ylabel("Frequency (Hz)")
+        figure.colorbar(image, ax=axes[1], shrink=0.8)
     figure.tight_layout()
     return figure
 
@@ -946,7 +974,8 @@ def _render_realtime_transcription() -> None:
         "Speak naturally and watch the transcript appear in real-time. This mode uses a persistent WebSocket connection for low-latency processing.",
         anchor_id="realtime-section",
     )
-    
+    ws_url_hint = json.dumps(_get_realtime_ws_url_hint())
+
     # We use a custom HTML component to handle the WebSocket and Audio recording
     # because Streamlit's native components are not optimized for low-latency streaming.
     st.components.v1.html(
@@ -968,12 +997,117 @@ def _render_realtime_transcription() -> None:
             let audioContext;
             let processor;
             let input;
+            let recognition;
+            let usingBrowserRecognition = false;
+            let browserTranscript = "";
+            let browserInterimTranscript = "";
+            let userStoppedRealtime = false;
 
             const startBtn = document.getElementById('start-rt');
             const stopBtn = document.getElementById('stop-rt');
             const denoiseCheckbox = document.getElementById('denoise-rt');
             const transcriptDiv = document.getElementById('transcript-rt');
             const statusSpan = document.getElementById('status-rt');
+            const configuredWsUrl = __WS_URL_HINT__;
+
+            const getWebSocketUrl = () => {
+                if (configuredWsUrl) {
+                    return configuredWsUrl;
+                }
+
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const hostname = window.location.hostname;
+                const isLocalHost = ['localhost', '127.0.0.1', '0.0.0.0'].includes(hostname);
+
+                if (isLocalHost) {
+                    return `${protocol}//${hostname}:8000/ws/transcribe`;
+                }
+
+                return `${protocol}//${window.location.host}/ws/transcribe`;
+            };
+
+            const renderBrowserTranscript = () => {
+                const finalText = browserTranscript.trim();
+                const interimText = browserInterimTranscript.trim();
+                transcriptDiv.innerText = [finalText, interimText].filter(Boolean).join(" ");
+                transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
+            };
+
+            const stopRealtimeCapture = () => {
+                if (processor) {
+                    processor.disconnect();
+                    processor = null;
+                }
+                if (input) {
+                    input.disconnect();
+                    if (input.mediaStream) {
+                        input.mediaStream.getTracks().forEach((track) => track.stop());
+                    }
+                    input = null;
+                }
+                if (audioContext && audioContext.state !== 'closed') {
+                    audioContext.close();
+                    audioContext = null;
+                }
+                if (recognition) {
+                    recognition.onend = null;
+                    recognition.stop();
+                    recognition = null;
+                }
+                if (socket) {
+                    socket.close();
+                    socket = null;
+                }
+            };
+
+            const startBrowserRecognition = () => {
+                const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+                if (!SpeechRecognition) {
+                    statusSpan.innerText = "Realtime transcription unavailable in this browser";
+                    statusSpan.style.color = "#ef4444";
+                    return false;
+                }
+
+                usingBrowserRecognition = true;
+                browserTranscript = "";
+                browserInterimTranscript = "";
+                recognition = new SpeechRecognition();
+                recognition.continuous = true;
+                recognition.interimResults = true;
+                recognition.lang = 'en-US';
+
+                recognition.onstart = () => {
+                    statusSpan.innerText = "Listening with browser speech recognition";
+                    statusSpan.style.color = "#10b981";
+                };
+
+                recognition.onresult = (event) => {
+                    browserInterimTranscript = "";
+                    for (let i = event.resultIndex; i < event.results.length; i += 1) {
+                        const piece = event.results[i][0].transcript;
+                        if (event.results[i].isFinal) {
+                            browserTranscript += piece + " ";
+                        } else {
+                            browserInterimTranscript += piece + " ";
+                        }
+                    }
+                    renderBrowserTranscript();
+                };
+
+                recognition.onerror = (event) => {
+                    statusSpan.innerText = `Browser speech recognition error: ${event.error}`;
+                    statusSpan.style.color = "#ef4444";
+                };
+
+                recognition.onend = () => {
+                    if (!userStoppedRealtime && recognition) {
+                        recognition.start();
+                    }
+                };
+
+                recognition.start();
+                return true;
+            };
 
             denoiseCheckbox.onchange = () => {
                 if (socket && socket.readyState === WebSocket.OPEN) {
@@ -982,49 +1116,80 @@ def _render_realtime_transcription() -> None:
             };
 
             startBtn.onclick = async () => {
-                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                const host = window.location.hostname;
-                const wsUrl = `${protocol}//${host}:8000/ws/transcribe`;
-                socket = new WebSocket(wsUrl);
+                userStoppedRealtime = false;
+                usingBrowserRecognition = false;
+                const wsUrl = getWebSocketUrl();
+                console.log("Connecting to WebSocket:", wsUrl);
                 
-                socket.onopen = () => {
-                    statusSpan.innerText = "● Connected";
-                    statusSpan.style.color = "#10b981";
-                    socket.send(JSON.stringify({ denoise: denoiseCheckbox.checked }));
-                };
-
-                socket.onmessage = (event) => {
-                    const data = JSON.parse(event.data);
-                    if (data.type === "final") {
-                        const tag = data.denoised ? "" : "";
-                        transcriptDiv.innerText += data.text + " ";
-                        transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
-                    } else if (data.type === "error") {
-                        statusSpan.innerText = "Error: " + data.message;
-                        statusSpan.style.color = "#ef4444";
-                    }
-                };
-
-                socket.onclose = () => {
-                    statusSpan.innerText = "Disconnected";
-                    statusSpan.style.color = "#64748b";
-                };
-
                 try {
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 16000});
-                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    input = audioContext.createMediaStreamSource(stream);
-                    processor = audioContext.createScriptProcessor(4096, 1, 1);
-
-                    processor.onaudioprocess = (e) => {
-                        const channelData = e.inputBuffer.getChannelData(0);
-                        if (socket.readyState === WebSocket.OPEN) {
-                            socket.send(channelData.buffer);
+                    socket = new WebSocket(wsUrl);
+                    let opened = false;
+                    
+                    socket.onerror = (err) => {
+                        console.error("WebSocket Error Object:", err);
+                        if (!opened && !usingBrowserRecognition) {
+                            statusSpan.innerText = "Realtime server unavailable, using browser mode";
+                            statusSpan.style.color = "#f59e0b";
+                            startBrowserRecognition();
                         }
                     };
 
-                    input.connect(processor);
-                    processor.connect(audioContext.destination);
+                    socket.onopen = () => {
+                        opened = true;
+                        statusSpan.innerText = "Connected";
+                        statusSpan.style.color = "#10b981";
+                        socket.send(JSON.stringify({ denoise: denoiseCheckbox.checked }));
+                    };
+
+                    socket.onmessage = (event) => {
+                        const data = JSON.parse(event.data);
+                        if (data.type === "final") {
+                            transcriptDiv.innerText += data.text + " ";
+                            transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
+                        } else if (data.type === "error") {
+                            statusSpan.innerText = "Error: " + data.message;
+                            statusSpan.style.color = "#ef4444";
+                        }
+                    };
+
+                    socket.onclose = () => {
+                        if (!opened && !usingBrowserRecognition && !userStoppedRealtime) {
+                            statusSpan.innerText = "Realtime server unavailable, using browser mode";
+                            statusSpan.style.color = "#f59e0b";
+                            startBrowserRecognition();
+                            return;
+                        }
+                        if (!usingBrowserRecognition) {
+                            statusSpan.innerText = "Disconnected";
+                            statusSpan.style.color = "#64748b";
+                        }
+                    };
+                } catch (e) {
+                    statusSpan.innerText = "Connection Failed";
+                    statusSpan.style.color = "#ef4444";
+                    console.error("WebSocket construction failed:", e);
+                    if (!startBrowserRecognition()) {
+                        return;
+                    }
+                }
+
+                try {
+                    if (!usingBrowserRecognition) {
+                        audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 16000});
+                        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                        input = audioContext.createMediaStreamSource(stream);
+                        processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                        processor.onaudioprocess = (e) => {
+                            const channelData = e.inputBuffer.getChannelData(0);
+                            if (socket && socket.readyState === WebSocket.OPEN) {
+                                socket.send(channelData.buffer);
+                            }
+                        };
+
+                        input.connect(processor);
+                        processor.connect(audioContext.destination);
+                    }
 
                     startBtn.disabled = true;
                     startBtn.style.background = "#e2e8f0";
@@ -1032,13 +1197,16 @@ def _render_realtime_transcription() -> None:
                     stopBtn.style.background = "#ef4444";
                     stopBtn.style.color = "white";
                 } catch (err) {
-                    alert("Mic access denied or WebSocket server not running on port 8000.");
+                    statusSpan.innerText = "Microphone access failed";
+                    statusSpan.style.color = "#ef4444";
+                    stopRealtimeCapture();
                 }
             };
 
             stopBtn.onclick = () => {
-                if (processor) { processor.disconnect(); input.disconnect(); }
-                if (socket) { socket.close(); }
+                userStoppedRealtime = true;
+                usingBrowserRecognition = false;
+                stopRealtimeCapture();
                 startBtn.disabled = false;
                 startBtn.style.background = "#0f766e";
                 stopBtn.disabled = true;
@@ -1047,7 +1215,7 @@ def _render_realtime_transcription() -> None:
                 statusSpan.innerText = "Stopped";
             };
         </script>
-        """,
+        """.replace("__WS_URL_HINT__", ws_url_hint),
         height=320,
     )
 
@@ -1100,7 +1268,11 @@ def _render_app_page() -> None:
         horizontal=True,
     )
 
-    denoise_enabled = st.checkbox("Apply AI Noise Reduction", value=True, help="Clean background noise before transcribing.")
+    denoise_enabled = st.checkbox(
+        "Apply AI Noise Reduction",
+        value=True,
+        help="Clean background noise before transcribing.",
+    )
 
     if input_method == "Real-time transcription":
         _render_realtime_transcription() # This already has its own denoise toggle in HTML

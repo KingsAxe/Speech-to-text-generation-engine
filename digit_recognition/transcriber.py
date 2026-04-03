@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import logging
 import math
 from pathlib import Path
 import tempfile
@@ -93,6 +95,51 @@ class TranscriptionResult:
                 for segment in self.segments
             ],
         }
+
+    def to_txt(self) -> str:
+        return self.text
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2)
+
+    def to_csv(self) -> str:
+        rows: list[str] = []
+        header = ["start_seconds", "end_seconds", "confidence", "text"]
+        rows.append(",".join(header))
+        for segment in self.segments:
+            row = [
+                f"{segment.start_seconds:.3f}",
+                f"{segment.end_seconds:.3f}",
+                f"{segment.confidence:.6f}",
+                '"' + segment.text.replace('"', '""') + '"',
+            ]
+            rows.append(",".join(row))
+        return "\n".join(rows)
+
+    def to_srt(self) -> str:
+        def _format_timestamp(value: float) -> str:
+            total_ms = max(int(round(value * 1000)), 0)
+            hours, remainder = divmod(total_ms, 3_600_000)
+            minutes, remainder = divmod(remainder, 60_000)
+            seconds, milliseconds = divmod(remainder, 1000)
+            return f"{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}"
+
+        if not self.segments:
+            end_time = max(self.duration_seconds, 0.0)
+            return (
+                "1\n"
+                f"{_format_timestamp(0.0)} --> {_format_timestamp(end_time)}\n"
+                f"{self.text}\n"
+            )
+
+        entries = []
+        for index, segment in enumerate(self.segments, start=1):
+            entries.append(
+                f"{index}\n"
+                f"{_format_timestamp(segment.start_seconds)} --> {_format_timestamp(segment.end_seconds)}\n"
+                f"{segment.text}\n"
+            )
+        return "\n".join(entries)
 
 
 class SpeechTranscriber:
@@ -212,13 +259,16 @@ class SpeechTranscriber:
 
         audio = np.asarray(audio_array, dtype=np.float32)
         if sample_rate and sample_rate != self.processor.sample_rate:
-            import librosa
+            try:
+                import librosa
 
-            audio = librosa.resample(
-                audio,
-                orig_sr=sample_rate,
-                target_sr=self.processor.sample_rate,
-            )
+                audio = librosa.resample(
+                    audio,
+                    orig_sr=sample_rate,
+                    target_sr=self.processor.sample_rate,
+                )
+            except ImportError:
+                audio = self.processor.resample_audio(audio, sample_rate, self.processor.sample_rate)
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
             temp_path = Path(temp_file.name)
